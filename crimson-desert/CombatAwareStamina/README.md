@@ -33,7 +33,28 @@ regen out of combat with `OutOfCombatRegenPercent`.
 
 **F8** toggles the mod in game (high beep = on, low beep = off).
 
-## Install
+## Install with Definitive Mod Manager (DMM)
+
+1. Build the zip on Windows: `powershell -ExecutionPolicy Bypass -File .\package.ps1`.
+   This gives you `build\CombatAwareStamina-DMM.zip`, which contains
+   `bin64\CombatAwareStamina.asi` and `bin64\CombatAwareStamina.ini`.
+2. In DMM, add or import that zip like any other Nexus download, enable it,
+   then apply.
+3. **Disable any DMM JSON stamina mods** (Infinite Stamina, Stamina & Spirit
+   consumption, Traversal Unbound and so on). They lower costs everywhere,
+   including in combat, which defeats the point.
+4. Launch the game through DMM as usual, then open
+   `<game>\bin64\CombatAwareStamina.log`. You want to see
+   `hooked stat-write at ...`.
+
+If the log file never appears, no ASI loader is loading the mod. If you already
+run other ASI mods through DMM, a loader is there. If not, install Ultimate ASI
+Loader (below).
+
+Fallback: if DMM doesn't place the files, copy both files into `<game>\bin64\`
+by hand. The mod doesn't depend on DMM in any way.
+
+## Install manually
 
 1. Install [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
    into `Crimson Desert\bin64\`. Most Crimson Desert ASI mods already need it,
