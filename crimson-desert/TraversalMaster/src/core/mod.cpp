@@ -1,0 +1,242 @@
+#include "core/mod.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cwchar>
+#include <string>
+#include <vector>
+
+#include "core/log.h"
+#include "core/paths.h"
+#include "game/mem.h"
+#include "game/stamina.h"
+#include "ini_default.h"
+#include "version.h"
+
+namespace
+{
+    std::atomic<bool> g_stop{false};
+    HANDLE g_thread = nullptr;
+
+    // StaminaMaster.ini next to the plugin, [settings] section.
+    float ReadSetting(const wchar_t* key, const wchar_t* fallback)
+    {
+        const std::wstring ini = sm::Paths::File(SM_INI);
+        wchar_t buf[64] = {};
+        GetPrivateProfileStringW(L"settings", key, fallback, buf, 64, ini.c_str());
+        return static_cast<float>(_wtof(buf));
+    }
+
+    // A DMM install is the plugin on its own, because the plugin is all DMM
+    // registers, so there is no ini beside it and nothing for anybody to edit.
+    // Every default is compiled in and the mod runs correctly without one,
+    // which is exactly why the absence is confusing. Write the documented ini
+    // out when there is none there. An existing file is never touched, however
+    // old or however empty.
+    void WriteDefaultIni()
+    {
+        const std::wstring path = sm::Paths::File(SM_INI);
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+
+        FILE* f = nullptr;
+        const errno_t e = _wfopen_s(&f, path.c_str(), L"wb");
+        if (e != 0 || !f)
+        {
+            LOG("[ini] %ls is not there and could not be written (errno %d). Every default is compiled "
+                "in, so the mod still runs; there is just no file to change one in.", SM_INI, e);
+            return;
+        }
+        const bool ok = fwrite(kDefaultIni, 1, kDefaultIniSize, f) == kDefaultIniSize;
+        fclose(f);
+        LOG(ok ? "[ini] no %ls beside the plugin, so one was written with every setting at its default "
+                 "and a note on each. Edit it and restart the game."
+               : "[ini] %ls was created but not written in full. Delete it and it will be written again.",
+            SM_INI);
+    }
+
+    // Comma / whitespace separated list, e.g. TraversalExtraSkills.
+    std::vector<std::string> ReadList(const wchar_t* key)
+    {
+        const std::wstring ini = sm::Paths::File(SM_INI);
+        wchar_t buf[8192] = {};
+        GetPrivateProfileStringW(L"settings", key, L"", buf, 8192, ini.c_str());
+        std::vector<std::string> out;
+        std::string cur;
+        for (const wchar_t* p = buf;; ++p)
+        {
+            const wchar_t c = *p;
+            if (c == 0 || c == L',' || c == L' ' || c == L'\t' || c == L';')
+            {
+                if (!cur.empty()) out.push_back(cur);
+                cur.clear();
+                if (c == 0 || c == L';') break;
+                continue;
+            }
+            if (c < 0x80) cur.push_back(static_cast<char>(c));
+        }
+        return out;
+    }
+
+    struct Settings
+    {
+        sm::stamina::Scale scale;
+        bool probe;       // the research report, and a line per skill changed
+    };
+
+    Settings ReadSettings()
+    {
+        Settings s;
+        s.scale.oneOff     = static_cast<int>(ReadSetting(L"UsePercent", L"0"));
+        s.scale.continuous = static_cast<int>(ReadSetting(L"ContinuousPercent", L"0"));
+        s.scale.mount      = static_cast<int>(ReadSetting(L"MountPercent", L"0"));
+        s.scale.mountRegen = static_cast<int>(ReadSetting(L"MountRegenPercent", L"400"));
+        s.scale.spirit     = static_cast<int>(ReadSetting(L"SpiritPercent", L"100"));
+        s.probe            = ReadSetting(L"Probe", L"0") != 0.0f;
+
+        s.scale.traversalOnly    = ReadSetting(L"TraversalOnly", L"1") != 0.0f;
+        s.scale.traversalPercent = static_cast<int>(ReadSetting(L"TraversalPercent", L"25"));
+        s.scale.traversalSkills  = sm::stamina::DefaultTraversalSkills();
+        for (auto& extra : ReadList(L"TraversalExtraSkills"))
+            s.scale.traversalSkills.push_back(extra);
+        for (auto& drop : ReadList(L"TraversalExcludeSkills"))
+            s.scale.traversalSkills.erase(
+                std::remove(s.scale.traversalSkills.begin(), s.scale.traversalSkills.end(), drop),
+                s.scale.traversalSkills.end());
+        return s;
+    }
+
+    DWORD WINAPI Worker(LPVOID)
+    {
+        WriteDefaultIni();
+        const Settings s = ReadSettings();
+
+        LOG("[mod] %s %s for Crimson Desert 2.04.08 (exe 1.0.0.3576). UsePercent=%d ContinuousPercent=%d "
+            "MountPercent=%d MountRegenPercent=%d SpiritPercent=%d Probe=%d", SM_NAME, SM_VERSION,
+            s.scale.oneOff, s.scale.continuous, s.scale.mount, s.scale.mountRegen, s.scale.spirit,
+            s.probe ? 1 : 0);
+        LOG("[mod] TraversalOnly=%d TraversalPercent=%d (%zu skills listed)", s.scale.traversalOnly ? 1 : 0,
+            s.scale.traversalPercent, s.scale.traversalSkills.size());
+        LOG("[mod] game image at 0x%p, %zu bytes",
+            reinterpret_cast<void*>(sm::mem::Game().base), sm::mem::Game().size);
+
+        // The tables are empty for the first seconds of a session, so both jobs
+        // are asked on every pass until they answer. Two minutes is generous
+        // for a load; past that something has changed and saying so beats
+        // polling in silence for the rest of the session.
+        int waited = 0;
+        bool probed = !s.probe, applied = false;
+        while (!g_stop.load())
+        {
+            // Before Apply, so the survey reports the game's own amounts
+            // rather than the scaled ones. Apply waits for it for the same
+            // reason.
+            if (!probed)
+            {
+                probed = sm::stamina::Probe(waited == 119);
+                if (probed) sm::stamina::SurveyCategories();
+            }
+            if (!applied && probed)
+            {
+                // 0 means the tables are not loaded yet and the call is worth
+                // repeating, unless there was nothing to do in the first place.
+                const bool costsUntouched = s.scale.traversalOnly
+                    ? s.scale.traversalPercent == 100
+                    : (s.scale.oneOff == 100 && s.scale.continuous == 100 && s.scale.mount == 100);
+                const bool nothingToDo = costsUntouched && s.scale.mountRegen == 100 &&
+                                         s.scale.spirit == 100;
+                const int n = sm::stamina::Apply(s.scale, s.probe);
+                applied = n != 0 || nothingToDo;
+            }
+            if (!(probed && applied) && ++waited == 120)
+            {
+                LOG_ERR("[mod] statusinfo and skill were still not both loaded after two minutes, or skill "
+                        "held no stamina cost yet, so no stamina cost has been changed this session. The "
+                        "table machinery has changed on this build.");
+                probed = applied = true;
+            }
+            if (probed && applied)
+                break;
+            for (int i = 0; i < 2 && !g_stop.load(); ++i) Sleep(500);
+        }
+
+        // Apply reads each write back as it makes it, which says the store
+        // landed and nothing else. These two say whether it is still there once
+        // the player is in the world, which is a different question and the one
+        // that mattered when the setting was 0 and stamina still drained. It is
+        // behind Probe because a session that is working has nothing to learn
+        // from it, and a bug report has everything.
+        for (int minute = 1; s.probe && minute <= 2 && !g_stop.load(); ++minute)
+        {
+            for (int i = 0; i < 120 && !g_stop.load(); ++i) Sleep(500);
+            if (g_stop.load()) break;
+            char when[32];
+            _snprintf_s(when, _countof(when), _TRUNCATE, "after %d minute%s", minute,
+                        minute == 1 ? "" : "s");
+            sm::stamina::Verify(when);
+        }
+        // The fault count is here for whoever reads someone else's fault log and
+        // finds this plugin named in it. Every pointer the table search considers
+        // is range-checked and then read under a handler, so an address that is
+        // in range but not mapped faults on purpose, is caught, and the search
+        // carries on. Thousands of those in a session is the normal shape.
+        const long faults = sm::mem::FaultCount();
+        LOG("[mod] worker stopped. %ld guarded read%s faulted and %s caught, which is the pointer "
+            "probe working rather than a near miss.", faults, faults == 1 ? "" : "s",
+            faults == 1 ? "was" : "were");
+        return 0;
+    }
+}
+
+namespace sm::Mod
+{
+    // The game is not the only process that loads this plugin.
+    // crashpad_handler.exe does too, with a 671,744-byte image on this build,
+    // which is how it is recognised here. That instance names its own log, says
+    // why it is doing nothing, and touches nothing.
+    static constexpr size_t kMinGameImage = 64ull * 1024 * 1024;
+
+    void Initialize(HMODULE module)
+    {
+        Paths::Init(module);
+        const size_t size = mem::Game().size;
+        if (!mem::Game().base || size < kMinGameImage)
+        {
+            // One fixed name, not one per process id. crashpad_handler.exe
+            // starts and exits repeatedly, and naming the file after the pid
+            // leaves a new one behind every time with nothing to clear them.
+            wchar_t name[96];
+            _snwprintf_s(name, _countof(name), _TRUNCATE, L"%s.other", SM_FILEBASE);
+            Log::ClaimSingle(name);
+
+            wchar_t exe[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            const wchar_t* leaf = wcsrchr(exe, L'\\');
+            LOG("[mod] %ls (pid %lu) has a %zu byte image, which is not the game, so nothing is changed "
+                "here. The game's own log is %ls.log.", leaf ? leaf + 1 : exe,
+                GetCurrentProcessId(), size, SM_FILEBASE);
+            Log::Shutdown();
+            return;
+        }
+        Log::Claim(SM_FILEBASE);
+        g_thread = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
+    }
+
+    void Shutdown(bool processExiting)
+    {
+        g_stop.store(true);
+        if (processExiting)
+        {
+            Log::Shutdown();
+            return;
+        }
+        if (g_thread)
+        {
+            WaitForSingleObject(g_thread, 3000);
+            CloseHandle(g_thread);
+            g_thread = nullptr;
+        }
+        Log::Shutdown();
+    }
+}
